@@ -1,1 +1,1 @@
-{"first": {"admin": "adib", "members": ["adib"]}, "abc": {"admin": "sakib", "members": ["sakib", "adib"]}, "b2": {"admin": "adib", "members": ["adib"]}, "ok": {"admin": "sakib", "members": ["sakib"]}}
+{"abc": {"admin": "sakib", "members": ["sakib", "adib"]}, "study": {"admin": "adib", "members": ["adib", "sakib", "omar"], "description": "This group is only for study"}}
