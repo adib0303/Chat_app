@@ -8,20 +8,63 @@ import base64
 import tempfile
 import time
 import datetime
+
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def get_data_path(filename):
+    """Get the absolute path to a file in the data directory"""
+    return os.path.join(SCRIPT_DIR, 'data', filename)
+
+def get_chat_path(filename):
+    """Get the absolute path to a chat history file"""
+    return os.path.join(SCRIPT_DIR, filename)
+
+def get_user_info_from_server(sock, username):
+    """Get user information from server"""
+    try:
+        send_json(sock, {'type': 'GET_USER_INFO', 'username': username})
+        resp = recv_json(sock)
+        if resp.get('type') == 'USER_INFO_RESPONSE':
+            return resp.get('user_info', {'name': username, 'dept': 'Unknown', 'session': 'Unknown'})
+    except Exception:
+        pass
+    return {'name': username, 'dept': 'Unknown', 'session': 'Unknown'}
 try:
     from PIL import Image, ImageTk
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
+# Import TCP Reno simulation
+try:
+    from tcp_reno_simulator import (initialize_reno, simulate_reno_transmission, get_reno_stats, 
+                                   toggle_reno, reset_reno_stats, show_reno_graph, 
+                                   start_graph_recording, stop_graph_recording, save_reno_graph)
+    RDT_AVAILABLE = True
+    print("[CHAT] 🚀 TCP Reno Algorithm module loaded!")
+except ImportError:
+    RDT_AVAILABLE = False
+    print("[CHAT] ⚠️  TCP Reno Algorithm module not available")
+
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 9999
 
 def send_json(sock, obj):
     """
-    Send JSON data with better error handling
+    Send JSON data with RDT simulation and better error handling
     """
     try:
+        # Check if socket is valid before sending
+        if sock is None:
+            raise ConnectionError('Socket is None')
+        
+        # Check if socket is still connected
+        try:
+            sock.getpeername()
+        except socket.error:
+            raise ConnectionError('Socket is not connected')
+        
         data = json.dumps(obj).encode('utf-8')
         length = f'{len(data):08d}'.encode('utf-8')
         
@@ -29,9 +72,35 @@ def send_json(sock, obj):
         if len(length) != 8:
             raise ValueError(f"Length header must be 8 bytes, got {len(length)}")
         
+        # RDT Simulation for message transmission
+        if RDT_AVAILABLE:
+            # Determine data type for RDT simulation
+            data_type = "message"
+            if obj.get('type') == 'MEDIA':
+                data_type = "media_file"
+            elif obj.get('type') == 'GROUP_MEDIA':
+                data_type = "group_media_file"
+            elif obj.get('type') == 'GROUP_MESSAGE':
+                data_type = "group_message"
+            elif obj.get('type') == 'PRIVATE_MESSAGE':
+                data_type = "private_message"
+            
+            # TCP Reno simulation (no delays)
+            simulate_reno_transmission(obj, data_type)
+            
         # Send all data at once to avoid partial sends
         full_message = length + data
         sock.sendall(full_message)
+        
+        # Update last activity time for connection monitoring
+        # (only if this is being called from ChatClient instance)
+        try:
+            import inspect
+            frame = inspect.currentframe()
+            if frame and frame.f_back and hasattr(frame.f_back.f_locals.get('self'), 'last_activity'):
+                frame.f_back.f_locals['self'].last_activity = time.time()
+        except:
+            pass  # Safe to ignore if not in ChatClient context
         
         # Optional debug for problematic cases
         # print(f"[SEND] Sent {len(full_message)} bytes (header: {repr(length)}, data: {len(data)} bytes)")
@@ -118,22 +187,47 @@ def recv_json(sock):
 class FriendManager:
     def __init__(self, username):
         self.username = username
-        self.file = f"friends_{username}.json"
+        self.file = get_data_path(f"friends_{username}.json")
         self.friends = set()
         self.load()
 
     def load(self):
-        if os.path.exists(self.file):
-            with open(self.file) as f:
-                self.friends = set(json.load(f))
+        """Load friends from JSON file"""
+        try:
+            if os.path.exists(self.file):
+                with open(self.file, 'r') as f:
+                    friends_list = json.load(f)
+                    self.friends = set(friends_list)
+                    print(f"[FRIEND_MANAGER] Loaded {len(self.friends)} friends for {self.username}: {list(self.friends)}")
+            else:
+                self.friends = set()
+                print(f"[FRIEND_MANAGER] No friend file found for {self.username}, starting with empty list")
+        except Exception as e:
+            print(f"[FRIEND_MANAGER] Error loading friends for {self.username}: {e}")
+            self.friends = set()
+
+    def reload(self):
+        """Force reload friends from file"""
+        print(f"[FRIEND_MANAGER] Force reloading friends for {self.username}")
+        self.load()
 
     def save(self):
-        with open(self.file, 'w') as f:
-            json.dump(list(self.friends), f)
+        """Save friends to JSON file"""
+        try:
+            with open(self.file, 'w') as f:
+                json.dump(list(self.friends), f)
+            print(f"[FRIEND_MANAGER] Saved {len(self.friends)} friends for {self.username}: {list(self.friends)}")
+        except Exception as e:
+            print(f"[FRIEND_MANAGER] Error saving friends for {self.username}: {e}")
 
     def add(self, friend):
-        self.friends.add(friend)
-        self.save()
+        """Add a friend and save to file"""
+        if friend not in self.friends:
+            self.friends.add(friend)
+            self.save()
+            print(f"[FRIEND_MANAGER] Added {friend} to {self.username}'s friend list")
+        else:
+            print(f"[FRIEND_MANAGER] {friend} already in {self.username}'s friend list")
 
     def remove(self, friend):
         if friend in self.friends:
@@ -178,6 +272,11 @@ class ChatClient:
         self.notifications_home = {}  # Initialize notifications_home early
         self.find_friend_window = None
         self.current_chat = None  # (type, name) where type is 'private' or 'group'
+        
+        # Connection monitoring
+        self.last_activity = time.time()
+        self.connection_check_interval = 30  # Check every 30 seconds
+        
         self.build_login()
 
     def build_login(self):
@@ -273,9 +372,20 @@ class ChatClient:
                 # Remove timeout for persistent connection
                 self.sock.settimeout(None)
                 self.friend_manager = FriendManager(name)
+                
+                # Initialize TCP Reno simulation
+                if RDT_AVAILABLE:
+                    initialize_reno(name)
+                    print(f"[CHAT] 🚀 TCP Reno simulation initialized for {name}")
+                
                 self.build_main()
+                # Force reload friend list after building main interface
+                self.friend_manager.reload()
                 self.refresh_friendlist()
                 threading.Thread(target=self.listen_server, daemon=True).start()
+                
+                # Start connection monitoring
+                self.start_connection_monitoring()
             else:
                 messagebox.showerror('Error', 'Registration failed!')
         except Exception as e:
@@ -299,9 +409,15 @@ class ChatClient:
             if resp.get('type') == 'LOGIN_SUCCESS':
                 self.connected = True
                 self.username = name
+                self.stored_password = password  # Store for reconnection
                 # Remove timeout for persistent connection
                 self.sock.settimeout(None)
                 self.friend_manager = FriendManager(name)
+                
+                # Initialize TCP Reno simulation
+                if RDT_AVAILABLE:
+                    initialize_reno(name)
+                    print(f"[CHAT] 🚀 TCP Reno simulation initialized for {name}")
                 
                 # Clear any old notifications from previous sessions
                 print("DEBUG: Clearing old notifications for new login session")
@@ -317,13 +433,121 @@ class ChatClient:
                 
                 self.build_main()
                 self.refresh_friendlist()
+                # Force reload friend list to ensure fresh data
+                print(f"DEBUG: Force reloading friend list after login for {name}")
+                self.friend_manager.reload()
+                self.refresh_friendlist()
                 self.listener_thread = threading.Thread(target=self.listen_server, daemon=True)
                 self.listener_thread.start()
+                
+                # Start connection monitoring
+                self.start_connection_monitoring()
             else:
                 messagebox.showerror('Error', resp.get('reason', 'Login failed!'))
         except Exception as e:
             messagebox.showerror('Error', f'Could not connect: {e}')
 
+    def check_connection(self):
+        """Check if the socket connection is still valid"""
+        if not self.sock:
+            return False
+        try:
+            self.sock.getpeername()
+            return True
+        except socket.error:
+            return False
+
+    def reconnect(self):
+        """Attempt to reconnect to the server"""
+        if not hasattr(self, 'username') or not self.username:
+            messagebox.showerror('Reconnection Failed', 'No username available for reconnection.')
+            return False
+        
+        try:
+            # Close existing socket if any
+            if self.sock:
+                try:
+                    self.sock.close()
+                except:
+                    pass
+            
+            # Create new socket
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.settimeout(30.0)
+            self.sock.connect((SERVER_HOST, SERVER_PORT))
+            
+            # Try to login again with stored credentials
+            if hasattr(self, 'stored_password'):
+                send_json(self.sock, {'type': 'LOGIN', 'name': self.username, 'password': self.stored_password})
+                resp = recv_json(self.sock)
+                if resp.get('type') == 'LOGIN_SUCCESS':
+                    self.connected = True
+                    self.sock.settimeout(None)
+                    
+                    # Restart listener thread
+                    if hasattr(self, 'listener_thread') and self.listener_thread and self.listener_thread.is_alive():
+                        self.connected = False
+                        self.listener_thread.join(timeout=1)
+                    
+                    self.listener_thread = threading.Thread(target=self.listen_server, daemon=True)
+                    self.listener_thread.start()
+                    
+                    messagebox.showinfo('Reconnected', 'Successfully reconnected to server!')
+                    return True
+                else:
+                    messagebox.showerror('Reconnection Failed', 'Failed to authenticate with server.')
+                    return False
+            else:
+                messagebox.showerror('Reconnection Failed', 'No stored credentials for automatic reconnection.')
+                return False
+                
+        except Exception as e:
+            messagebox.showerror('Reconnection Failed', f'Could not reconnect: {e}')
+            return False
+
+    def start_connection_monitoring(self):
+        """Start periodic connection monitoring"""
+        def monitor_connection():
+            while self.connected:
+                try:
+                    time.sleep(self.connection_check_interval)
+                    
+                    # Check if connection is still alive
+                    if self.connected and not self.check_connection():
+                        print("[MONITOR] Connection lost, attempting to reconnect...")
+                        
+                        # Try to reconnect
+                        if self.attempt_reconnection():
+                            print("[MONITOR] Successfully reconnected")
+                            # Restart listener thread if needed
+                            if not (hasattr(self, 'listener_thread') and 
+                                   self.listener_thread and self.listener_thread.is_alive()):
+                                self.listener_thread = threading.Thread(target=self.listen_server, daemon=True)
+                                self.listener_thread.start()
+                        else:
+                            print("[MONITOR] Failed to reconnect, showing user notification")
+                            self.master.after(0, lambda: messagebox.showwarning(
+                                'Connection Lost', 
+                                'Connection to server was lost. Please try logging out and logging back in.'))
+                            break
+                            
+                except Exception as e:
+                    print(f"[MONITOR] Error in connection monitoring: {e}")
+                    break
+        
+        # Start monitoring thread
+        monitor_thread = threading.Thread(target=monitor_connection, daemon=True)
+        monitor_thread.start()
+
+    def send_heartbeat(self):
+        """Send a heartbeat to keep connection alive"""
+        try:
+            if self.connected and self.sock:
+                send_json(self.sock, {'type': 'PING'})
+                self.last_activity = time.time()
+        except Exception:
+            pass  # Heartbeat failed, will be caught by connection monitoring
 
     def build_main(self):
         self.clear_window()
@@ -378,6 +602,13 @@ class ChatClient:
         tk.Button(btns_frame, text='Refresh Friends', command=self.request_user_list).pack(side=tk.LEFT, padx=2)
         tk.Button(btns_frame, text='Find Friend', command=self.find_friend).pack(side=tk.LEFT, padx=2)
         tk.Button(btns_frame, text='Create Group', command=self.create_group).pack(side=tk.LEFT, padx=2)
+        
+        # RDT Stats button (only if RDT is available)
+        if RDT_AVAILABLE:
+            tk.Button(btns_frame, text='📊 Reno Stats', command=self.show_rdt_stats, bg='lightblue').pack(side=tk.LEFT, padx=2)
+            tk.Button(btns_frame, text='⚡ Toggle Reno', command=self.toggle_rdt_simulation, bg='yellow').pack(side=tk.LEFT, padx=2)
+            tk.Button(btns_frame, text='🔄 Reset Stats', command=self.reset_reno_stats, bg='orange').pack(side=tk.LEFT, padx=2)
+            tk.Button(btns_frame, text='📈 CWND Graph', command=self.show_cwnd_graph, bg='lightgreen').pack(side=tk.LEFT, padx=2)
 
         # Chat area (shared for private/group) - Split into info and chat sections
         
@@ -563,7 +794,7 @@ class ChatClient:
         # Load group information from groups.json
         group_info = {'admin': 'Unknown', 'members': [], 'description': ''}
         try:
-            with open('data/groups.json', 'r') as f:
+            with open(get_data_path('groups.json'), 'r') as f:
                 groups_data = json.load(f)
                 if group_name in groups_data:
                     group_info = groups_data[group_name]
@@ -761,6 +992,243 @@ class ChatClient:
         
         tk.Button(win, text='Save', command=save_profile).pack(pady=10)
 
+    def show_rdt_stats(self):
+        """Show TCP Reno transmission statistics"""
+        if not RDT_AVAILABLE:
+            messagebox.showwarning('TCP Reno Stats', 'TCP Reno simulation is not available')
+            return
+            
+        try:
+            stats = get_reno_stats()
+            
+            win = tk.Toplevel(self.master)
+            win.title('📊 TCP Reno Algorithm Statistics')
+            win.geometry('500x450')
+            win.configure(bg='white')
+            
+            # Title
+            title_label = tk.Label(win, text='🚀 TCP Reno Performance Statistics', 
+                                 font=('Arial', 14, 'bold'), bg='white', fg='navy')
+            title_label.pack(pady=15)
+            
+            # Stats frame
+            stats_frame = tk.Frame(win, bg='white')
+            stats_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+            
+            # Create stats display
+            stats_text = tk.Text(stats_frame, height=20, width=60, font=('Courier', 9))
+            stats_text.pack(fill=tk.BOTH, expand=True)
+            
+            # Format TCP Reno statistics
+            stats_display = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                    TCP RENO ALGORITHM                        ║
+╠══════════════════════════════════════════════════════════════╣
+║ User: {self.username:<50} ║
+║                                                              ║
+║ � Congestion Control State:                                ║
+║    • Current CWND: {stats.get('cwnd', 0):<35.2f} ║
+║    • Slow Start Threshold: {stats.get('ssthresh', 0):<26.2f} ║
+║    • Current State: {stats.get('state', 'N/A'):<33} ║
+║                                                              ║
+║ 📈 Transmission Statistics:                                 ║
+║    • Packets Sent: {stats.get('packets_sent', 0):<35} ║
+║    • Total Retransmissions: {stats.get('retransmissions', 0):<26} ║
+║    • Fast Retransmits: {stats.get('fast_retransmits', 0):<30} ║
+║    • Timeouts: {stats.get('timeouts', 0):<41} ║
+║                                                              ║
+║ � Network Conditions:                                      ║
+║    • Current Loss Rate: {stats.get('loss_rate', 0)*100:<28.1f}% ║
+║    • Algorithm: {stats.get('algorithm', 'Unknown'):<41} ║
+║                                                              ║
+║ 🎯 Performance Metrics:                                     ║
+║    • Retransmission Ratio: {(stats.get('retransmissions', 0) / max(stats.get('packets_sent', 1), 1) * 100):<25.1f}% ║
+║    • Fast Recovery Usage: {(stats.get('fast_retransmits', 0) / max(stats.get('retransmissions', 1), 1) * 100):<27.1f}% ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+
+🔍 TCP Reno Algorithm Explanation:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 SLOW START Phase:
+   • CWND grows exponentially (doubles every RTT)
+   • Continues until CWND ≥ SSTHRESH
+   • Formula: CWND += 1 for each ACK
+
+📍 CONGESTION AVOIDANCE Phase:
+   • CWND grows linearly (+1 per RTT)
+   • Formula: CWND += 1/CWND for each ACK
+   • More conservative growth
+
+� FAST RETRANSMIT:
+   • Triggered by 3 duplicate ACKs
+   • Immediately retransmits lost packet
+   • Avoids timeout delay
+
+📍 FAST RECOVERY:
+   • Entered after Fast Retransmit
+   • SSTHRESH = CWND/2, CWND = SSTHRESH + 3
+   • Inflates window for each additional dup ACK
+   • Exits on new ACK → Congestion Avoidance
+
+💡 Real-time Monitoring:
+   • Watch terminal during message/file sending
+   • See actual congestion control decisions
+   • Different data sizes trigger different behaviors
+"""
+            
+            stats_text.insert(tk.END, stats_display)
+            stats_text.config(state='disabled')
+            
+            # Buttons frame
+            btn_frame = tk.Frame(win, bg='white')
+            btn_frame.pack(pady=10)
+            
+            # Refresh button
+            def refresh_stats():
+                new_stats = get_reno_stats()
+                stats_text.config(state='normal')
+                stats_text.delete(1.0, tk.END)
+                
+                # Update display with new stats
+                updated_display = stats_display.replace(
+                    f"Current CWND: {stats.get('cwnd', 0):<35.2f}",
+                    f"Current CWND: {new_stats.get('cwnd', 0):<35.2f}"
+                ).replace(
+                    f"Current State: {stats.get('state', 'N/A'):<33}",
+                    f"Current State: {new_stats.get('state', 'N/A'):<33}"
+                ).replace(
+                    f"Packets Sent: {stats.get('packets_sent', 0):<35}",
+                    f"Packets Sent: {new_stats.get('packets_sent', 0):<35}"
+                ).replace(
+                    f"Fast Retransmits: {stats.get('fast_retransmits', 0):<30}",
+                    f"Fast Retransmits: {new_stats.get('fast_retransmits', 0):<30}"
+                )
+                
+                stats_text.insert(tk.END, updated_display)
+                stats_text.config(state='disabled')
+                
+            refresh_btn = tk.Button(btn_frame, text='🔄 Refresh Stats', command=refresh_stats, 
+                                  bg='lightblue', font=('Arial', 10, 'bold'))
+            refresh_btn.pack(side=tk.LEFT, padx=5)
+            
+            # Reset stats button
+            def reset_stats():
+                if messagebox.askyesno('Reset Statistics', 'Are you sure you want to reset all TCP Reno statistics?'):
+                    reset_reno_stats()
+                    refresh_stats()
+                    messagebox.showinfo('Reset Complete', 'TCP Reno statistics have been reset.')
+            
+            reset_btn = tk.Button(btn_frame, text='🔄 Reset Stats', command=reset_stats, 
+                                bg='orange', font=('Arial', 10, 'bold'))
+            reset_btn.pack(side=tk.LEFT, padx=5)
+            
+            close_btn = tk.Button(btn_frame, text='Close', command=win.destroy, 
+                                bg='lightcoral', font=('Arial', 10))
+            close_btn.pack(side=tk.LEFT, padx=5)
+            
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to get TCP Reno stats: {e}')
+
+    def toggle_rdt_simulation(self):
+        """Toggle TCP Reno simulation on/off"""
+        if not RDT_AVAILABLE:
+            messagebox.showwarning('TCP Reno Toggle', 'TCP Reno simulation is not available')
+            return
+            
+        try:
+            enabled = toggle_reno()
+            status = "ENABLED" if enabled else "DISABLED"
+            messagebox.showinfo('TCP Reno Toggle', f'TCP Reno simulation is now {status}')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to toggle TCP Reno: {e}')
+
+    def reset_reno_stats(self):
+        """Reset TCP Reno statistics"""
+        if not RDT_AVAILABLE:
+            messagebox.showwarning('Reset Stats', 'TCP Reno simulation is not available')
+            return
+            
+        try:
+            success = reset_reno_stats()
+            if success:
+                messagebox.showinfo('Reset Complete', 'TCP Reno statistics have been reset.')
+            else:
+                messagebox.showwarning('Reset Failed', 'TCP Reno controller not initialized.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to reset stats: {e}')
+
+    def show_cwnd_graph(self):
+        """Show TCP Reno CWND automated graph"""
+        if not RDT_AVAILABLE:
+            messagebox.showwarning('CWND Graph', 'TCP Reno simulation is not available')
+            return
+            
+        try:
+            # Check if matplotlib is available
+            try:
+                import matplotlib.pyplot as plt
+                import matplotlib.animation as animation
+            except ImportError:
+                messagebox.showerror('Graph Error', 
+                    'Matplotlib is required for graphing.\n\n'
+                    'Please install it with:\n'
+                    'pip install matplotlib\n\n'
+                    'Then restart the application.')
+                return
+            
+            # Start recording if not already started
+            start_graph_recording()
+            
+            # Show the graph window
+            graph_window = show_reno_graph(self.master)
+            
+            if graph_window:
+                # Show instructions dialog
+                instructions = """
+🚀 TCP Reno CWND Graph Instructions:
+
+📊 Real-time Monitoring:
+• The graph shows Congestion Window (CWND) evolution
+• Blue line: Current CWND value
+• Red dashed line: Slow Start Threshold (SSTHRESH)
+• Different colors mark algorithm states
+
+📈 Graph Features:
+• ▶️ Start/Stop recording data points
+• 🗑️ Clear all graph data
+• Real-time updates during message/file transmission
+
+🎯 How to Generate Data:
+• Send messages or files to see CWND changes
+• Larger files create more interesting patterns
+• Different network conditions trigger different behaviors
+
+📍 Algorithm States:
+• Green triangles: Slow Start phase
+• Blue squares: Congestion Avoidance phase  
+• Red X marks: Fast Recovery phase
+• Annotations show special events
+
+💡 Tips:
+• Send multiple files to see complete algorithm behavior
+• Watch for Fast Retransmit and Timeout events
+• Graph automatically saves data between sessions
+                """
+                
+                messagebox.showinfo('CWND Graph Help', instructions)
+                
+                messagebox.showinfo('Graph Ready', 
+                    '📈 TCP Reno CWND Graph is now active!\n\n'
+                    '✅ Start sending messages or files to see the graph update\n'
+                    '✅ The graph records data automatically during transmissions\n'
+                    '✅ Try sending different sized files for varied patterns')
+            else:
+                messagebox.showwarning('Graph Error', 'Could not create graph window')
+                
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to show CWND graph: {e}')
+
     # Deprecated: All private chats now use the main chat area
     def open_private_chat(self, user):
         self.open_chat_in_main(user)
@@ -792,6 +1260,11 @@ class ChatClient:
         import base64
         from tkinter import filedialog
         
+        # Check connection first
+        if not self.connected or not self.sock:
+            messagebox.showerror('Connection Error', 'Not connected to server. Please login again.')
+            return
+        
         if not hasattr(self, 'current_chat') or not self.current_chat or self.current_chat[0] != 'group':
             messagebox.showinfo('Info', 'Please select a group chat first.')
             return
@@ -800,7 +1273,18 @@ class ChatClient:
         file_path = filedialog.askopenfilename(title='Select file to send')
         if not file_path:
             return
+            
+        # Check file size (limit to 10MB for safety)
+        file_size = os.path.getsize(file_path)
+        if file_size > 10 * 1024 * 1024:  # 10MB limit
+            messagebox.showerror('File Too Large', 'File size must be less than 10MB.')
+            return
+        
         try:
+            # Show progress for large files
+            if file_size > 1024 * 1024:  # 1MB
+                messagebox.showinfo('Sending File', f'Sending {os.path.basename(file_path)}...\nPlease wait.')
+            
             with open(file_path, 'rb') as f:
                 data = f.read()
             encoded = base64.b64encode(data).decode()
@@ -809,7 +1293,27 @@ class ChatClient:
             timestamp = current_time.isoformat()
             
             msg = {'type': 'GROUP_MEDIA', 'group_name': group_name, 'from': self.username, 'filename': filename, 'data': encoded, 'timestamp': timestamp}
+            
+            # Verify connection before sending
+            if not self.check_connection():
+                print("[GROUP_FILE_SEND] Connection lost before sending, attempting reconnection...")
+                if not self.reconnect():
+                    raise ConnectionError("Failed to reconnect before sending file")
+            
+            # Try to send the message
             send_json(self.sock, msg)
+            
+            # Verify connection is still alive after sending
+            if not self.check_connection():
+                print("[GROUP_FILE_SEND] WARNING: Connection may have been lost during file transmission")
+                # Try to reconnect silently
+                if self.reconnect():
+                    print("[GROUP_FILE_SEND] Successfully reconnected after file transmission")
+                else:
+                    print("[GROUP_FILE_SEND] Failed to reconnect after file transmission")
+                    messagebox.showwarning('Connection Warning', 
+                        f'File "{filename}" was sent successfully to group "{group_name}", but connection was lost.\n'
+                        'You may need to reconnect manually if you experience issues.')
             
             # Display file in chat for sender
             self.display_file_in_main(self.username, filename, encoded, align='right')
@@ -819,12 +1323,25 @@ class ChatClient:
             arr = [self.username, '', 'right', True, filename, encoded, timestamp]
             with open(group_history_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(arr) + '\n')
+            
+            # Show success message for large files
+            if file_size > 1024 * 1024:  # 1MB
+                messagebox.showinfo('File Sent', f'{filename} sent successfully!')
                 
+        except ConnectionError as e:
+            messagebox.showerror('Connection Error', 
+                f'Failed to send file due to connection issue:\n{str(e)}\n\n'
+                'Please check your connection and try again.')
         except Exception as e:
             messagebox.showerror('Error', f'Failed to send file: {e}')
     def send_file(self, to_user):
         import os
         from tkinter import filedialog
+        
+        # Check connection first
+        if not self.connected or not self.sock:
+            messagebox.showerror('Connection Error', 'Not connected to server. Please login again.')
+            return
         
         # Check if the user is a friend before sending file
         if not self.friend_manager.is_friend(to_user):
@@ -834,7 +1351,18 @@ class ChatClient:
         file_path = filedialog.askopenfilename(title='Select file to send')
         if not file_path:
             return
+            
+        # Check file size (limit to 10MB for safety)
+        file_size = os.path.getsize(file_path)
+        if file_size > 10 * 1024 * 1024:  # 10MB limit
+            messagebox.showerror('File Too Large', 'File size must be less than 10MB.')
+            return
+            
         try:
+            # Show progress for large files
+            if file_size > 1024 * 1024:  # 1MB
+                messagebox.showinfo('Sending File', f'Sending {os.path.basename(file_path)}...\nPlease wait.')
+            
             with open(file_path, 'rb') as f:
                 data = f.read()
             import base64
@@ -844,15 +1372,46 @@ class ChatClient:
             timestamp = current_time.isoformat()
             
             msg = {'type': 'MEDIA', 'to': to_user, 'from': self.username, 'filename': filename, 'data': encoded, 'timestamp': timestamp}
+            
+            # Verify connection before sending
+            if not self.check_connection():
+                print("[FILE_SEND] Connection lost before sending, attempting reconnection...")
+                if not self.reconnect():
+                    raise ConnectionError("Failed to reconnect before sending file")
+            
+            # Try to send the message
             send_json(self.sock, msg)
+            
+            # Verify connection is still alive after sending
+            if not self.check_connection():
+                print("[FILE_SEND] WARNING: Connection may have been lost during file transmission")
+                # Try to reconnect silently
+                if self.reconnect():
+                    print("[FILE_SEND] Successfully reconnected after file transmission")
+                else:
+                    print("[FILE_SEND] Failed to reconnect after file transmission")
+                    messagebox.showwarning('Connection Warning', 
+                        f'File "{filename}" was sent successfully, but connection was lost.\n'
+                        'You may need to reconnect manually if you experience issues.')
+            
             # Display file in chat for sender
             self.display_file_in_main(self.username, filename, encoded, align='right', timestamp=timestamp)
+            
             # Save to chat history with timestamp
             users = sorted([self.username, to_user])
             history_file = f"chat_{users[0]}_{users[1]}.json"
             arr = [self.username, '', 'right', True, filename, encoded, timestamp]
             with open(history_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(arr) + '\n')
+            
+            # Show success message for large files
+            if file_size > 1024 * 1024:  # 1MB
+                messagebox.showinfo('File Sent', f'{filename} sent successfully!')
+                
+        except ConnectionError as e:
+            messagebox.showerror('Connection Error', 
+                f'Failed to send file due to connection issue:\n{str(e)}\n\n'
+                'Please check your connection and try again.')
         except Exception as e:
             messagebox.showerror('Error', f'Failed to send file: {e}')
 
@@ -924,17 +1483,52 @@ class ChatClient:
         
         canvas.bind_all("<MouseWheel>", on_mousewheel)
         
-        # Load all users from users.json file
+        # Request all users from server instead of reading local file
         all_users = []
         users_data = {}
+        
+        # First try: Get users from server
+        server_success = False
         try:
-            with open('data/users.json', 'r') as f:
-                users_data = json.load(f)
+            # Send request to server for user list
+            send_json(self.sock, {'type': 'GET_ALL_USERS'})
+            resp = recv_json(self.sock)
+            
+            if resp.get('type') == 'ALL_USERS_RESPONSE':
+                users_data = resp.get('users', {})
                 all_users = list(users_data.keys())
+                server_success = True
+                print(f"✅ Got {len(all_users)} users from server")
+            elif resp.get('type') == 'ERROR':
+                print(f"⚠️ Server error: {resp.get('message', 'Unknown error')}")
+            else:
+                print(f"⚠️ Unexpected server response: {resp}")
         except Exception as e:
-            messagebox.showerror('Error', f'Could not load users: {e}')
-            find_win.destroy()
-            return
+            print(f"❌ Error getting users from server: {e}")
+        
+        # Second try: Fall back to local file if server failed
+        if not server_success:
+            try:
+                with open(get_data_path('users.json'), 'r') as f:
+                    users_data = json.load(f)
+                    all_users = list(users_data.keys())
+                    print(f"✅ Fallback: Got {len(all_users)} users from local file")
+            except Exception as e2:
+                # Third try: Use hardcoded default users as last resort
+                print(f"⚠️ Local file also failed: {e2}")
+                print("💡 Using default user list as fallback")
+                users_data = {
+                    "adib": {"name": "adib", "dept": "cse", "session": "2021-22"},
+                    "habib": {"name": "habib", "dept": "eee", "session": "2021-22"},
+                    "jim": {"name": "jim", "dept": "cse", "session": "2021-22"},
+                    "sakib": {"name": "sakib", "dept": "cse", "session": "2021-22"}
+                }
+                all_users = list(users_data.keys())
+                print(f"✅ Using default {len(all_users)} users")
+                
+                # Show info to user about the fallback
+                tk.Label(find_win, text="Note: Using default user list (server/file unavailable)", 
+                        fg='orange', font=('Arial', 9)).pack(pady=5)
         
         # Store user frames for selection
         user_frames = {}
@@ -1083,7 +1677,7 @@ class ChatClient:
         def refresh_users():
             """Refresh the user list from users.json"""
             try:
-                with open('data/users.json', 'r') as f:
+                with open(get_data_path('users.json'), 'r') as f:
                     new_users_data = json.load(f)
                     users_data.clear()
                     users_data.update(new_users_data)
@@ -1446,7 +2040,7 @@ class ChatClient:
         
         # Get current group information
         try:
-            with open('data/groups.json', 'r') as f:
+            with open(get_data_path('groups.json'), 'r') as f:
                 groups_data = json.load(f)
                 if group_name not in groups_data:
                     messagebox.showerror('Error', f'Group "{group_name}" not found.')
@@ -1571,7 +2165,7 @@ class ChatClient:
                 # Get current user's info for the invitation
                 user_info = {'name': self.username, 'dept': 'Unknown', 'session': 'Unknown'}
                 try:
-                    with open('data/users.json', 'r') as f:
+                    with open(get_data_path('users.json'), 'r') as f:
                         users_data = json.load(f)
                         if self.username in users_data:
                             user_info = users_data[self.username]
@@ -1751,6 +2345,11 @@ class ChatClient:
     def send_message(self, event=None):
         import json
         
+        # Check connection first
+        if not self.connected or not self.sock:
+            messagebox.showerror('Connection Error', 'Not connected to server. Please login again.')
+            return
+        
         msg = self.msg_entry.get().strip()
         if not msg:
             return
@@ -1759,32 +2358,41 @@ class ChatClient:
             current_time = datetime.datetime.now()
             timestamp = current_time.isoformat()
             
-            if chat_type == 'private':
-                # Check if the user is a friend before sending message
-                is_friend = self.friend_manager.is_friend(name)
-                print(f"DEBUG: Checking if {self.username} is friends with {name}: {is_friend}")
-                print(f"DEBUG: Current friends list: {self.friend_manager.get_all()}")
-                
-                if not is_friend:
-                    messagebox.showwarning('Not Friends', f'You need to be friends with {name} to send messages.\nSend a friend request first.')
-                    return
+            try:
+                if chat_type == 'private':
+                    # Check if the user is a friend before sending message
+                    is_friend = self.friend_manager.is_friend(name)
+                    print(f"DEBUG: Checking if {self.username} is friends with {name}: {is_friend}")
+                    print(f"DEBUG: Current friends list: {self.friend_manager.get_all()}")
                     
-                send_json(self.sock, {'type': 'PRIVATE_MESSAGE', 'to': name, 'from': self.username, 'msg': msg, 'timestamp': timestamp})
-                self.display_message_in_main(self.username, msg, align='right', timestamp=timestamp)
-                # Save to chat history with timestamp
-                users = sorted([self.username, name])
-                history_file = f"chat_{users[0]}_{users[1]}.json"
-                arr = [self.username, msg, 'right', False, None, None, timestamp]
-                with open(history_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(arr) + '\n')
-            elif chat_type == 'group':
-                send_json(self.sock, {'type': 'GROUP_MESSAGE', 'group_name': name, 'from': self.username, 'msg': msg, 'timestamp': timestamp})
-                self.display_message_in_main(f'You (Group {name})', msg, align='right', timestamp=timestamp)
-                # Save to group chat history with timestamp
-                group_history_file = f"group_chat_{name}.json"
-                arr = [self.username, msg, 'right', False, None, None, timestamp]
-                with open(group_history_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(arr) + '\n')
+                    if not is_friend:
+                        messagebox.showwarning('Not Friends', f'You need to be friends with {name} to send messages.\nSend a friend request first.')
+                        return
+                        
+                    send_json(self.sock, {'type': 'PRIVATE_MESSAGE', 'to': name, 'from': self.username, 'msg': msg, 'timestamp': timestamp})
+                    self.display_message_in_main(self.username, msg, align='right', timestamp=timestamp)
+                    # Save to chat history with timestamp
+                    users = sorted([self.username, name])
+                    history_file = f"chat_{users[0]}_{users[1]}.json"
+                    arr = [self.username, msg, 'right', False, None, None, timestamp]
+                    with open(history_file, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(arr) + '\n')
+                elif chat_type == 'group':
+                    send_json(self.sock, {'type': 'GROUP_MESSAGE', 'group_name': name, 'from': self.username, 'msg': msg, 'timestamp': timestamp})
+                    self.display_message_in_main(f'You (Group {name})', msg, align='right', timestamp=timestamp)
+                    # Save to group chat history with timestamp
+                    group_history_file = f"group_chat_{name}.json"
+                    arr = [self.username, msg, 'right', False, None, None, timestamp]
+                    with open(group_history_file, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(arr) + '\n')
+            except ConnectionError as e:
+                messagebox.showerror('Connection Error', 
+                    f'Failed to send message due to connection issue:\n{str(e)}\n\n'
+                    'Please check your connection and try again.')
+                return
+            except Exception as e:
+                messagebox.showerror('Error', f'Failed to send message: {e}')
+                return
         else:
             messagebox.showinfo('Info', 'Select a user or join a group to chat.')
         self.msg_entry.delete(0, tk.END)
@@ -1828,9 +2436,9 @@ class ChatClient:
             # Attempt connection
             self.sock.connect((SERVER_HOST, SERVER_PORT))
             
-            # Re-login
-            if hasattr(self, 'username'):
-                send_json(self.sock, {'type': 'LOGIN', 'name': self.username, 'password': getattr(self, 'password', '')})
+            # Re-login using stored credentials
+            if hasattr(self, 'username') and hasattr(self, 'stored_password'):
+                send_json(self.sock, {'type': 'LOGIN', 'name': self.username, 'password': self.stored_password})
                 resp = recv_json(self.sock)
                 
                 if resp.get('type') == 'LOGIN_SUCCESS':
@@ -1839,10 +2447,10 @@ class ChatClient:
                     self.sock.settimeout(None)  # Remove timeout for listening
                     return True
                 else:
-                    print("[RECONNECT] Login failed after reconnection")
+                    print(f"[RECONNECT] Login failed after reconnection: {resp.get('reason', 'Unknown error')}")
                     return False
             else:
-                print("[RECONNECT] No username available for re-login")
+                print("[RECONNECT] No stored credentials available for re-login")
                 return False
                 
         except Exception as e:
@@ -1905,11 +2513,40 @@ class ChatClient:
                             #     })
                     elif mtype == 'FRIEND_REQUEST_ACCEPTED':
                         from_user = message.get('from')
+                        print(f"[FRIEND_REQUEST_ACCEPTED] ===== RECEIVED ACCEPTANCE NOTIFICATION =====")
+                        print(f"[FRIEND_REQUEST_ACCEPTED] User {self.username} received acceptance from {from_user}")
+                        print(f"[FRIEND_REQUEST_ACCEPTED] Current friends before: {self.friend_manager.get_all()}")
                         if from_user:
+                            # Force reload friend list from file first
+                            self.friend_manager.reload()
                             # Add to friend list
                             self.friend_manager.add(from_user)
+                            print(f"[FRIEND_REQUEST_ACCEPTED] Added {from_user} to friend list")
+                            print(f"[FRIEND_REQUEST_ACCEPTED] Current friends after: {self.friend_manager.get_all()}")
                             self.refresh_friendlist()
+                            print(f"[FRIEND_REQUEST_ACCEPTED] Refreshed friend list display")
                             messagebox.showinfo('Friend Request Accepted', f'{from_user} accepted your friend request!')
+                            print(f"[FRIEND_REQUEST_ACCEPTED] ===== ACCEPTANCE PROCESSING COMPLETE =====")
+                        else:
+                            print(f"[FRIEND_REQUEST_ACCEPTED] ERROR: No from_user in message: {message}")
+                    elif mtype == 'FRIEND_ADDED':
+                        # Notification for the user who accepted the friend request
+                        friend_name = message.get('friend')
+                        print(f"[FRIEND_ADDED] ===== RECEIVED FRIEND ADDED NOTIFICATION =====")
+                        print(f"[FRIEND_ADDED] User {self.username} notified that {friend_name} was added")
+                        print(f"[FRIEND_ADDED] Current friends before: {self.friend_manager.get_all()}")
+                        if friend_name:
+                            # Force reload friend list from file first
+                            self.friend_manager.reload()
+                            # Make sure the friend is in our list and refresh
+                            self.friend_manager.add(friend_name)
+                            print(f"[FRIEND_ADDED] Ensured {friend_name} is in friend list")
+                            print(f"[FRIEND_ADDED] Current friends after: {self.friend_manager.get_all()}")
+                            self.refresh_friendlist()
+                            print(f"[FRIEND_ADDED] Refreshed friend list display")
+                            print(f"[FRIEND_ADDED] ===== FRIEND ADDED PROCESSING COMPLETE =====")
+                        else:
+                            print(f"[FRIEND_ADDED] ERROR: No friend_name in message: {message}")
                     elif mtype == 'FRIEND_REQUEST_DECLINED':
                         from_user = message.get('from')
                         if from_user:
@@ -2423,7 +3060,7 @@ class ChatClient:
         # Load friend information from users.json
         friend_info = {'name': friend, 'dept': 'Unknown', 'session': 'Unknown'}
         try:
-            with open('data/users.json', 'r') as f:
+            with open(get_data_path('users.json'), 'r') as f:
                 users_data = json.load(f)
                 if friend in users_data:
                     friend_info = users_data[friend]
@@ -3266,24 +3903,30 @@ class ChatClient:
         
         # Button functions
         def accept_request():
-            print(f"DEBUG: Accept button clicked for {sender}")
+            print(f"[FRIEND_REQUEST_ACCEPT] ===== ACCEPTING FRIEND REQUEST =====")
+            print(f"[FRIEND_REQUEST_ACCEPT] User {self.username} accepting request from {sender}")
             try:
+                # Force reload friend list from file first
+                self.friend_manager.reload()
                 # Add to friend list locally FIRST
                 self.friend_manager.add(sender)
-                print(f"DEBUG: Added {sender} to local friend list")
-                print(f"DEBUG: Current friends: {self.friend_manager.get_all()}")
+                print(f"[FRIEND_REQUEST_ACCEPT] Added {sender} to local friend list")
+                print(f"[FRIEND_REQUEST_ACCEPT] Current friends: {self.friend_manager.get_all()}")
                 
                 # Send acceptance to server
-                send_json(self.sock, {
+                response_data = {
                     'type': 'FRIEND_REQUEST_RESPONSE',
                     'from': self.username,
                     'to': sender,
                     'accepted': True
-                })
-                print(f"DEBUG: Sent acceptance to server")
+                }
+                print(f"[FRIEND_REQUEST_ACCEPT] Sending to server: {response_data}")
+                send_json(self.sock, response_data)
+                print(f"[FRIEND_REQUEST_ACCEPT] Sent acceptance to server successfully")
                 
                 # Refresh friend list display
                 self.refresh_friendlist()
+                print(f"[FRIEND_REQUEST_ACCEPT] Refreshed friend list display")
                 
                 # Close dialog
                 dialog.destroy()
@@ -3291,6 +3934,7 @@ class ChatClient:
                 # Show success message
                 messagebox.showinfo('Friend Added', 
                                   f'{sender} has been added to your friends!')
+                print(f"[FRIEND_REQUEST_ACCEPT] ===== ACCEPTANCE COMPLETE =====")
                 
                 # Remove notification from home
                 self.remove_notification(sender)
